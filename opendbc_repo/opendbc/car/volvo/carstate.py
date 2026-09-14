@@ -1,237 +1,311 @@
-from cereal import custom
-from opendbc.car import Bus, ButtonType, create_button_events, structs
-from opendbc.can.parser import CANParser
+from collections import deque
+
+from opendbc.can import CANDefine, CANParser
+from opendbc.car import Bus, DT_CTRL, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.volvo.values import CAR, DBC, VolvoC1PlatformConfig, VolvoSPAPlatformConfig
+from opendbc.car.volvo.values import CAR, DBC, VolvoFlags, C1_CAR, EUCD_CAR, CarControllerParams as CCP
 
+ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
-TransmissionType = structs.CarParams.TransmissionType
 
-# main-bus SPEED (0x60) is raw counts in the DBC; measured against GPS ground speed.
-# Must match VOLVO_SPEED_TO_MS in opendbc/safety/modes/volvo.h.
-SPEED_TO_MS = 0.003977
-STEERING_PRESSED_THRESHOLD = 2
+
+class diagInfo:
+  """Diagnostic information container"""
+  def __init__(self):
+    self.diagFSMResp = 0
+    self.diagCEMResp = 0
+    self.diagPSCMResp = 0
+    self.diagCVMResp = 0
+
+
+class PSCMInfo:
+  """Power Steering Control Module information"""
+  def __init__(self):
+    self.byte0 = 0
+    self.byte4 = 0
+    self.byte7 = 0
+    self.LKAActive = 0
+    self.LKATorque = 0
+    self.SteeringAngleServo = 0
+    self.byte3 = 0  # C1 platform
+    self.SteeringWheelRateOfChange = 0  # EUCD platform
+
+
+class FSMInfo:
+  """Forward Sensing Module information"""
+  def __init__(self):
+    self.TrqLim = 0
+    self.LKAAngleReq = 0
+    self.Checksum = 0
+    self.LKASteerDirection = 0
+    # C1 platform
+    self.SET_X_E3 = 0
+    self.SET_X_B4 = 0
+    self.SET_X_08 = 0
+    self.SET_X_02 = 0
+    self.SET_X_25 = 0
+    # EUCD platform
+    self.SET_X_22 = 0
+    self.SET_X_A4 = 0
+    self.SET_X_10 = 0
 
 
 class CarState(CarStateBase):
-  def __init__(self, CP, FPCP):
-    super().__init__(CP, FPCP)
-    self.is_c1 = isinstance(CAR(CP.carFingerprint).config, VolvoC1PlatformConfig)
-    self.is_spa = isinstance(CAR(CP.carFingerprint).config, VolvoSPAPlatformConfig)
-    self.gas_pressed_prev = False
-    self.dispatch_lca_2_msg = False
-    self.msg_pscm = {}
-    self.msg_lca = {}
-    self.msg_lca_2 = {}
-    self.msg_lca_3 = {}
-    self.msg_gear_position = {}
-    self.pilot_assist_engaged = False
-    self.msg_lca_5 = {}  # Formerly msg_speed_1
-    self.msg_speed = {}
-    self.msg_speed_2 = {}
-    self.msg_0x1a = {}
-    self.msg_egsm = {}
-    self.msg_pscm_related = {}
-    self.msg_lca_4 = {}
-    self.msg_lca_6 = {}
-    self.msg_lca_7 = {}
-    self.c1_msg_pscm = {}
-    self.c1_lka_torque = 0
-    self.c1_button_states = {
-      "ACCOnOffBtn": False,
-      "ACCStopBtn": False,
-      "ACCSetBtn": False,
-      "ACCResumeBtn": False,
-      "ACCMinusBtn": False,
-      "TimeGapIncreaseBtn": False,
-      "TimeGapDecreaseBtn": False,
-    }
+  def __init__(self, CP):
+    super().__init__(CP)
+    self.diag = diagInfo()
+    self.PSCMInfo = PSCMInfo()
+    self.FSMInfo = FSMInfo()
+    
+    self.trq_fifo = deque([])
+    self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.pt])
 
-  def update(self, can_parsers, starpilot_toggles) -> structs.CarState:
-    if self.is_c1:
-      return self._update_c1(can_parsers)
+    if CP.flags & VolvoFlags.C1:
+      self.shifter_values = self.can_define.dv["TCM0"]["GearShifter"]
 
-    cp_main = can_parsers[Bus.main]
-    cp_pt = can_parsers[Bus.pt]
-    cp_party = can_parsers[Bus.party]
-    ret = structs.CarState()
-
-    # car speed
-    # SPEED on the main bus, not BUS1_SPEED on the PT bus: the main bus is identical
-    # across harnesses, while which car bus lands on PT (bus 1) is not, and the PT DBC
-    # in use depends on the fingerprint. Regressed against GPS ground speed over two
-    # routes on different harnesses: r=0.99989 both, residual sd 0.35-0.40 km/h.
-    ret.vEgoRaw = cp_main.vl["SPEED"]["SPEED"] * SPEED_TO_MS
-    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
-    ret.standstill = ret.vEgoRaw <= 0.1 # 0.1 m/s
-
-    # gas
-    # CMA ECM_1.ACCELERATOR_PEDAL_POS is raw 0-255 (DBC factor 1, idle ~20).
-    # SPA ECM_1.ACCELERATOR_PEDAL_POS is DBC-scaled to percent (factor 0.00390625, idle ~0).
-    # Thresholds must match volvo.h (see opendbc/safety/modes/volvo.h GAS_PRESSED_THRESHOLD_*)
-    # and opendbc/safety/tests/test_volvo.py::test_gas_threshold_self_consistent.
-    if self.is_spa:
-      ret.gasPressed = cp_pt.vl["ECM_1"]["ACCELERATOR_PEDAL_POS"] > 1.0  # percent
-    else:
-      ret.gasPressed = cp_pt.vl["ECM_1"]["ACCELERATOR_PEDAL_POS"] > 20+1  # raw counts, 20 baseline + 1 tolerance
-
-    # brake
-    #ret.brakePressed = bool(cp_main.vl["LCA_2"]["BRAKE_PEDAL_PRESSED_A"] or cp_main.vl["LCA_2"]["BRAKE_PEDAL_PRESSED_B"])
-    # BRAKE_PEDAL_PRESSED_A goes active when user starts pressing brake pedal, but no brake light is on yet due to tolerance
-    # BRAKE_PEDAL_PRESSED_B goes active when when the brake pedal is pressed above minimum threshold, brake light is on
-    ret.brakePressed = cp_main.vl["LCA_2"]["BRAKE_PEDAL_PRESSED_B"] == 1
-    ret.parkingBrake = False # TODO: add parking brake
-
-    # stability control - becomes true when ESC intervenes (e.g., aquaplaning)
-    ret.espActive = cp_main.vl["LCA_2"]["ESC_ACTUATING"] == 1 and cp_main.vl["LCA_2"]["ESC_ELIGIBLE"] == 1
-
-    # steering wheel
-    ret.steeringAngleDeg = cp_party.vl['PSCM']['PSCM_ANGLE_SENSOR'] # openpilot expects a negative value for a right turn
-    #ret.steeringAngleDeg = cp_party.vl['SAS']['SAS_ANGLE_SENSOR']
-
-    ret.steeringTorque = -cp_party.vl['DRIVER_INPUT']['STEERING_DRIVER_INPUT']  # Car right turn is negative, openpilot right turn is positive
-    driver_input = abs(cp_party.vl['DRIVER_INPUT']['STEERING_DRIVER_INPUT'])
-    ret.steeringPressed = driver_input > STEERING_PRESSED_THRESHOLD
-
-    # EPS status - placeholder until actual signal is found
-    self.eps_active = True  # Assume EPS is active for now
-
-    if self.is_spa:
-      # SPA: byte 0 bit 1, inverted (0 = cruise on, 1 = cruise off)
-      cruise_raw = cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_SPA_ENABLED"] == 1
-    else:
-      # CMA: two separate boolean signals
-      cruise_raw = cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_ENABLED"] == 1 or cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_ENABLED_IDLE_TRAFFIC"] == 1
-
-    ret.cruiseState.enabled = cruise_raw
-
-    self.gas_pressed_prev = ret.gasPressed
-    ret.cruiseState.available = True  # TODO: Determine actual availability
-    ret.cruiseState.speed = 0  # TODO: Find cruise set speed (not required for lateral control)
-    ret.cruiseState.nonAdaptive = False
-    ret.cruiseState.standstill = ret.standstill # False # Todo: Find cruise control standstill signal
-
-    # gear
-    gearPosition = cp_main.vl['GEAR_POSITION']['GEAR_POSITION'] # 0: P; 1: R; 2: N; 3: D; 4: B;
-    if gearPosition == 0:
-      ret.gearShifter = GearShifter.park
-    elif gearPosition == 1:
-      ret.gearShifter = GearShifter.reverse
-    elif gearPosition == 2:
-      ret.gearShifter = GearShifter.neutral
-    elif gearPosition == 3:
-      ret.gearShifter = GearShifter.drive
-    elif gearPosition == 4:
-      ret.gearShifter = GearShifter.drive
-
-    # blinkers TODO FlexRay
-    ret.leftBlinker = False
-    ret.rightBlinker = False
-
-    # lock info TODO FlexRay
-    ret.doorOpen = False # TODO: add door open
-    ret.seatbeltUnlatched = False # TODO: add seatbelt unlatched
-
-    # Store entire message dictionaries
-    self.msg_pscm = cp_party.vl['PSCM']
-    self.msg_lca = cp_main.vl['LCA']
-    self.msg_lca_2 = cp_main.vl['LCA_2']
-    self.msg_lca_3 = cp_main.vl['LCA_3']
-    self.msg_lca_4 = cp_main.vl['LCA_4']
-    self.msg_lca_5 = cp_main.vl['LCA_5']
-    self.msg_lca_6 = cp_main.vl['LCA_6']
-    self.msg_lca_7 = cp_main.vl['LCA_7']
-    self.msg_speed = cp_main.vl['SPEED']
-    self.msg_speed_2 = cp_main.vl['SPEED_2']
-    self.msg_gear_position = cp_main.vl['GEAR_POSITION']
-    self.msg_egsm = cp_party.vl['EGSM']
-    self.msg_pscm_related = cp_party.vl['PSCM_RELATED']
-
-    self.pilot_assist_engaged = cp_main.vl['LCA_2']['PILOT_ASSIST_ENGAGED'] == 1
-
-    fp_ret = custom.StarPilotCarState.new_message()
-    return ret, fp_ret
-
-  def _update_c1(self, can_parsers):
+  def update(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.pt]
     cp_cam = can_parsers[Bus.cam]
+
     ret = structs.CarState()
 
+    # Speeds
     ret.vEgoRaw = cp.vl["VehicleSpeed1"]["VehicleSpeed"] * CV.KPH_TO_MS
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
     ret.standstill = ret.vEgoRaw < 0.1
 
+    # Steering
     ret.steeringAngleDeg = cp.vl["PSCM1"]["SteeringAngleServo"]
     ret.steeringTorque = cp.vl["PSCM1"]["LKATorque"]
-    ret.steeringPressed = False
+    ret.steeringPressed = bool(
+      cp.vl["CCButtons"]["ACCSetBtn"] or
+      cp.vl["CCButtons"]["ACCMinusBtn"] or
+      cp.vl["CCButtons"]["ACCResumeBtn"]
+    )
 
-    ret.gasPressed = cp.vl["PedalandBrake"]["AccPedal"] > 5.0
-    ret.brakePressed = bool(cp.vl["PedalandBrake"]["BrakePedalActive2"] or
-                            cp.vl["PedalandBrake"]["BrakePedalActive"])
+    # Update gas and brake
+    if self.CP.flags & VolvoFlags.C1:
+      ret.gas = cp.vl["PedalandBrake"]["AccPedal"] / 102.3
+      ret.gasPressed = ret.gas > 0.05
+    elif self.CP.flags & VolvoFlags.EUCD:
+      ret.gas = cp.vl["AccPedal"]["AccPedal"] / 102.3
+      ret.gasPressed = ret.gas > 0.1
+    ret.brakePressed = False
 
-    ret.gearShifter = {
-      0: GearShifter.park,
-      1: GearShifter.reverse,
-      2: GearShifter.neutral,
-      3: GearShifter.drive,
-    }.get(int(cp.vl["TCM0"]["GearShifter"]), GearShifter.unknown)
+    # Update gear position
+    if self.CP.flags & VolvoFlags.C1:
+      can_gear = int(cp.vl["TCM0"]["GearShifter"])
+      ret.gearShifter = self.parse_gear_shifter(self.shifter_values.get(can_gear, None))
+    elif self.CP.flags & VolvoFlags.EUCD:
+      ret.gearShifter = self.parse_gear_shifter('D')  # TODO: Gear EUCD
 
-    ret.cruiseState.available = bool(cp_cam.vl["FSM0"]["ACCStatusOnOff"])
-    ret.cruiseState.enabled = bool(cp_cam.vl["FSM0"]["ACCStatusActive"])
-    ret.cruiseState.speed = cp.vl["ACC"]["SpeedTargetACC"] * CV.KPH_TO_MS
-    ret.cruiseState.nonAdaptive = False
-    ret.cruiseState.standstill = ret.standstill
-
-    turn_signal = int(cp.vl["MiscCarInfo"]["TurnSignal"])
-    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_stalk(
-      50, turn_signal == 1, turn_signal == 3)
+    # Belt and doors
     ret.doorOpen = False
-    ret.seatbeltUnlatched = False
+    ret.seatbeltUnlatched = False  # No signal yet
 
-    button_types = {
-      "ACCOnOffBtn": ButtonType.mainCruise,
-      "ACCStopBtn": ButtonType.cancel,
-      "ACCSetBtn": ButtonType.setCruise,
-      "ACCResumeBtn": ButtonType.resumeCruise,
-      "ACCMinusBtn": ButtonType.decelCruise,
-      "TimeGapIncreaseBtn": ButtonType.gapAdjustCruise,
-      "TimeGapDecreaseBtn": ButtonType.gapAdjustCruise,
-    }
-    button_events = []
-    for signal, button_type in button_types.items():
-      pressed = bool(cp.vl["CCButtons"][signal])
-      button_events.extend(create_button_events(pressed, self.c1_button_states[signal], {True: button_type}))
-      self.c1_button_states[signal] = pressed
-    ret.buttonEvents = button_events
+    # ACC status from camera
+    if self.CP.flags & VolvoFlags.C1:
+      ret.cruiseState.available = bool(cp_cam.vl["FSM0"]["ACCStatusOnOff"])
+      ret.cruiseState.enabled = bool(cp_cam.vl["FSM0"]["ACCStatusActive"])
+      ret.cruiseState.speed = cp.vl["ACC"]["SpeedTargetACC"] * CV.KPH_TO_MS
 
-    self.c1_msg_pscm = cp.vl["PSCM1"]
-    self.c1_lka_torque = int(cp.vl["PSCM1"]["LKATorque"])
+    elif self.CP.flags & VolvoFlags.EUCD:
+      accStatus = cp_cam.vl["FSM0"]["ACCStatus"]
+      if accStatus == 2:
+        ret.cruiseState.available = True
+        ret.cruiseState.enabled = False
+      elif accStatus >= 6:
+        ret.cruiseState.available = True
+        ret.cruiseState.enabled = True
+      else:
+        ret.cruiseState.available = False
+        ret.cruiseState.enabled = False
 
-    fp_ret = custom.StarPilotCarState.new_message()
-    return ret, fp_ret
+    # Blinkers
+    ret.leftBlinker = cp.vl["MiscCarInfo"]["TurnSignal"] == 1
+    ret.rightBlinker = cp.vl["MiscCarInfo"]["TurnSignal"] == 3
+
+    # Diagnostics
+    self.diag.diagFSMResp = int(cp_cam.vl["diagFSMResp"]["byte03"])
+    self.diag.diagCEMResp = int(cp.vl["diagCEMResp"]["byte03"])
+    self.diag.diagCVMResp = int(cp.vl["diagCVMResp"]["byte03"])
+    self.diag.diagPSCMResp = int(cp.vl["diagPSCMResp"]["byte03"])
+
+    # PSCMInfo
+    self.PSCMInfo.byte0 = int(cp.vl["PSCM1"]["byte0"])
+    self.PSCMInfo.byte4 = int(cp.vl["PSCM1"]["byte4"])
+    self.PSCMInfo.byte7 = int(cp.vl["PSCM1"]["byte7"])
+    self.PSCMInfo.LKATorque = int(cp.vl["PSCM1"]["LKATorque"])
+    self.PSCMInfo.LKAActive = int(cp.vl["PSCM1"]["LKAActive"])
+    self.PSCMInfo.SteeringAngleServo = float(cp.vl["PSCM1"]["SteeringAngleServo"])
+
+    if self.CP.flags & VolvoFlags.C1:
+      self.PSCMInfo.byte3 = int(cp.vl["PSCM1"]["byte3"])
+    elif self.CP.flags & VolvoFlags.EUCD:
+      self.PSCMInfo.SteeringWheelRateOfChange = float(cp.vl["PSCM1"]["SteeringWheelRateOfChange"])
+
+    # FSMInfo
+    if self.CP.flags & VolvoFlags.C1:
+      self.FSMInfo.TrqLim = int(cp_cam.vl["FSM1"]["TrqLim"])
+      self.FSMInfo.LKAAngleReq = float(cp_cam.vl["FSM1"]["LKAAngleReq"])
+      self.FSMInfo.Checksum = int(cp_cam.vl["FSM1"]["Checksum"])
+      self.FSMInfo.LKASteerDirection = int(cp_cam.vl["FSM1"]["LKASteerDirection"])
+      self.FSMInfo.SET_X_E3 = int(cp_cam.vl["FSM1"]["SET_X_E3"])
+      self.FSMInfo.SET_X_B4 = int(cp_cam.vl["FSM1"]["SET_X_B4"])
+      self.FSMInfo.SET_X_08 = int(cp_cam.vl["FSM1"]["SET_X_08"])
+      self.FSMInfo.SET_X_02 = int(cp_cam.vl["FSM1"]["SET_X_02"])
+      self.FSMInfo.SET_X_25 = int(cp_cam.vl["FSM1"]["SET_X_25"])
+
+    elif self.CP.flags & VolvoFlags.EUCD:
+      self.FSMInfo.TrqLim = int(cp_cam.vl["FSM2"]["TrqLim"])
+      self.FSMInfo.LKAAngleReq = float(cp_cam.vl["FSM2"]["LKAAngleReq"])
+      self.FSMInfo.Checksum = int(cp_cam.vl["FSM2"]["Checksum"])
+      self.FSMInfo.LKASteerDirection = int(cp_cam.vl["FSM2"]["LKASteerDirection"])
+      self.FSMInfo.SET_X_22 = int(cp_cam.vl["FSM2"]["SET_X_22"])
+      self.FSMInfo.SET_X_02 = int(cp_cam.vl["FSM2"]["SET_X_02"])
+      self.FSMInfo.SET_X_A4 = int(cp_cam.vl["FSM2"]["SET_X_A4"])
+      self.FSMInfo.SET_X_10 = int(cp_cam.vl["FSM2"]["SET_X_10"])
+
+    # Check if servo stops responding when ACC is active
+    if self.CP.flags & VolvoFlags.C1:
+      if ret.cruiseState.enabled and ret.vEgo > self.CP.minSteerSpeed:
+        self.trq_fifo.append(self.PSCMInfo.LKATorque)
+        ret.steerWarning = bool(self.trq_fifo.count(0) >= CCP.N_ZERO_TRQ * 2)
+        if len(self.trq_fifo) > CCP.N_ZERO_TRQ * 2:
+          self.trq_fifo.popleft()
+      else:
+        self.trq_fifo.clear()
+        ret.steerWarning = False
+
+    # Brake lights
+    ret.brakeLights = ret.brakePressed
+
+    return ret
 
   @staticmethod
   def get_can_parsers(CP):
-    if isinstance(CAR(CP.carFingerprint).config, VolvoC1PlatformConfig):
-      return {
-        Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [
-          ("VehicleSpeed1", 50),
-          ("CCButtons", 100),
-          ("PSCM1", 50),
-          ("PedalandBrake", 100),
-          ("TCM0", 10),
-          ("ACC", 17),
-          ("MiscCarInfo", 25),
-        ], 0),
-        Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.cam], [
-          ("FSM0", 100),
-          ("FSM1", 50),
-        ], 2),
-      }
+    # Common signals for both platforms
+    signals = [
+      ("VehicleSpeed", "VehicleSpeed1", 0),
+      ("TurnSignal", "MiscCarInfo", 0),
+      ("ACCOnOffBtn", "CCButtons", 0),
+      ("ACCResumeBtn", "CCButtons", 0),
+      ("ACCSetBtn", "CCButtons", 0),
+      ("ACCMinusBtn", "CCButtons", 0),
+      ("TimeGapIncreaseBtn", "CCButtons", 0),
+      ("TimeGapDecreaseBtn", "CCButtons", 0),
+      # PSCM signals
+      ("SteeringAngleServo", "PSCM1", 0),
+      ("LKATorque", "PSCM1", 0),
+      ("LKAActive", "PSCM1", 0),
+      ("byte0", "PSCM1", 0),
+      ("byte4", "PSCM1", 0),
+      ("byte7", "PSCM1", 0),
+      # Diagnostic
+      ("byte03", "diagCEMResp", 0),
+      ("byte47", "diagCEMResp", 0),
+      ("byte03", "diagPSCMResp", 0),
+      ("byte47", "diagPSCMResp", 0),
+      ("byte03", "diagCVMResp", 0),
+      ("byte47", "diagCVMResp", 0),
+    ]
 
-    return {
-      Bus.main: CANParser(DBC[CP.carFingerprint][Bus.main], [], 0),
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
-      Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], 2),
-    }
+    checks = [
+      ("CCButtons", 100),
+      ("PSCM1", 50),
+      ("VehicleSpeed1", 50),
+      ("MiscCarInfo", 25),
+      ("diagCEMResp", 0),
+      ("diagPSCMResp", 0),
+      ("diagCVMResp", 0),
+    ]
+
+    # Platform specific signals
+    if CP.flags & VolvoFlags.C1:
+      signals.extend([
+        ("SpeedTargetACC", "ACC", 0),
+        ("BrakePedalActive2", "PedalandBrake", 0),
+        ("AccPedal", "PedalandBrake", 0),
+        ("BrakePress0", "BrakeMessages", 0),
+        ("BrakePress1", "BrakeMessages", 0),
+        ("BrakeStatus", "BrakeMessages", 0),
+        ("GearShifter", "TCM0", 0),
+        ("byte3", "PSCM1", 0),
+        ("ACCStopBtn", "CCButtons", 0),
+      ])
+      checks.extend([
+        ("BrakeMessages", 50),
+        ("ACC", 17),
+        ("PedalandBrake", 100),
+        ("TCM0", 10),
+      ])
+
+    if CP.flags & VolvoFlags.EUCD:
+      signals.extend([
+        ("AccPedal", "AccPedal", 0),
+        ("BrakePedal", "BrakePedal", 0),
+        ("SteeringWheelRateOfChange", "PSCM1", 0),
+        # Inverted button states
+        ("ACCOnOffBtnInv", "CCButtons", 1),
+        ("ACCResumeBtnInv", "CCButtons", 1),
+        ("ACCSetBtnInv", "CCButtons", 1),
+        ("ACCMinusBtnInv", "CCButtons", 1),
+        ("TimeGapDecreaseBtnInv", "CCButtons", 1),
+        ("TimeGapIncreaseBtnInv", "CCButtons", 1),
+      ])
+      checks.extend([
+        ("AccPedal", 100),
+        ("BrakePedal", 50),
+      ])
+
+    pt_parser = CANParser(DBC[CP.carFingerprint][Bus.pt], signals, checks, 0)
+
+    # Camera CAN parser
+    cam_signals = [
+      ("byte03", "diagFSMResp", 0),
+      ("byte47", "diagFSMResp", 0),
+    ]
+    cam_checks = [
+      ("diagFSMResp", 0),
+    ]
+
+    if CP.flags & VolvoFlags.C1:
+      cam_signals.extend([
+        ("TrqLim", "FSM1", 0x80),
+        ("LKAAngleReq", "FSM1", 0x2000),
+        ("Checksum", "FSM1", 0x5f),
+        ("LKASteerDirection", "FSM1", 0x00),
+        ("SET_X_E3", "FSM1", 0xE3),
+        ("SET_X_B4", "FSM1", 0xB4),
+        ("SET_X_08", "FSM1", 0x08),
+        ("SET_X_02", "FSM1", 0x02),
+        ("SET_X_25", "FSM1", 0x25),
+        ("ACCStatusOnOff", "FSM0", 0x00),
+        ("ACCStatusActive", "FSM0", 0x00),
+      ])
+      cam_checks.extend([
+        ("FSM0", 100),
+        ("FSM1", 50),
+      ])
+
+    elif CP.flags & VolvoFlags.EUCD:
+      cam_signals.extend([
+        ("ACCStatus", "FSM0", 0),
+        ("TrqLim", "FSM2", 0x80),
+        ("LKAAngleReq", "FSM2", 0x2000),
+        ("Checksum", "FSM2", 0x5f),
+        ("LKASteerDirection", "FSM2", 0x00),
+        ("SET_X_22", "FSM2", 0x00),
+        ("SET_X_02", "FSM2", 0x00),
+        ("SET_X_10", "FSM2", 0x00),
+        ("SET_X_A4", "FSM2", 0x00),
+      ])
+      cam_checks.extend([
+        ("FSM0", 100),
+        ("FSM2", 50),
+      ])
+
+    cam_parser = CANParser(DBC[CP.carFingerprint][Bus.pt], cam_signals, cam_checks, 2)
+
+    return {Bus.pt: pt_parser, Bus.cam: cam_parser}
